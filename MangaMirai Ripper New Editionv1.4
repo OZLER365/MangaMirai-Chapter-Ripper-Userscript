@@ -1,0 +1,175 @@
+// ==UserScript==
+// @name         MangaMirai Ripper
+// @namespace    http://tampermonkey.net/
+// @version      1.4
+// @description  Capture, descramble, deduplicate, and download images. Renames sequentially (1..N) preserving original sort order.
+// @author       ozler365
+// @match        https://mangamirai.com/*
+// @license      MIT
+// @icon         https://pbs.twimg.com/profile_images/1896093828861612032/HYJOz-c3_400x400.png
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const STATE = {
+        images: new Map(), // Hash -> { blob, originalName, blobUrl }
+        canvas: {},        // Url -> { w, h, instructions }
+        count: 0,
+        uiPending: false
+    };
+
+    // --- Utilities ---
+    const toHex = b => b.toString(16).padStart(2, '0');
+    async function getHash(blob) {
+        const buf = await blob.arrayBuffer();
+        const hash = await crypto.subtle.digest('SHA-256', buf);
+        return Array.from(new Uint8Array(hash)).map(toHex).join('');
+    }
+
+    function getName(url) {
+        try {
+            return decodeURIComponent(new URL(url, location.origin).pathname.split('/').pop().split('?')[0]).trim();
+        } catch { return 'image.jpg'; }
+    }
+
+    // --- UI ---
+    const ui = document.createElement('div');
+    Object.assign(ui.style, {
+        position: 'fixed', bottom: '15px', right: '15px', width: '120px',
+        background: '#222', color: '#eee', padding: '10px', borderRadius: '6px',
+        fontSize: '11px', fontFamily: 'sans-serif', zIndex: 999999,
+        boxShadow: '0 2px 5px rgba(0,0,0,0.5)', border: '1px solid #444'
+    });
+    ui.innerHTML = `<div id="md-stat" style="color:#aaa;margin-bottom:5px">Ready</div>
+                    <div id="md-cnt" style="color:#4f9;font-weight:bold;margin-bottom:8px">0 images</div>
+                    <button id="md-btn" style="width:100%;cursor:pointer;padding:4px;background:#36d;color:#fff;border:none;border-radius:3px">Download</button>`;
+    document.body.appendChild(ui);
+
+    const els = { stat: ui.querySelector('#md-stat'), cnt: ui.querySelector('#md-cnt'), btn: ui.querySelector('#md-btn') };
+    
+    function renderUI(txt) {
+        if (txt) els.stat.textContent = txt;
+        if (!STATE.uiPending) {
+            STATE.uiPending = true;
+            requestAnimationFrame(() => {
+                els.cnt.textContent = `${STATE.count} images`;
+                STATE.uiPending = false;
+            });
+        }
+    }
+
+    els.btn.onclick = async () => {
+        els.btn.disabled = true;
+        const zip = new JSZip();
+        const sortFn = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' }).compare;
+        
+        // 1. Sort by Original Filename
+        const list = Array.from(STATE.images.values()).sort((a, b) => sortFn(a.originalName, b.originalName));
+        
+        // 2. Process & Rename Sequentially
+        for (let i = 0; i < list.length; i++) {
+            renderUI(`Processing ${i + 1}/${list.length}`);
+            const item = list[i];
+            let blob = item.blob;
+            
+            // Descramble if needed
+            const instr = item.blobUrl && STATE.canvas[item.blobUrl];
+            if (instr && instr.cmds.length) {
+                try { blob = await descramble(blob, instr); } catch {}
+            }
+            
+            // Rename to 1.jpg, 2.jpg, etc.
+            zip.file(`${i + 1}.jpg`, blob);
+        }
+
+        renderUI('Zipping...');
+        const content = await zip.generateAsync({ type: 'blob' });
+        saveAs(content, (document.title || 'chapter').trim() + '.zip');
+        renderUI('Done'); els.btn.disabled = false;
+        setTimeout(() => renderUI('Ready'), 2000);
+    };
+
+    // --- Core Logic ---
+    const origFetch = window.fetch;
+    window.fetch = async function(input, init) {
+        const res = await origFetch.apply(this, arguments);
+        const type = res.headers.get('content-type');
+        if (type && type.includes('image')) {
+            const clone = res.clone();
+            clone.blob().then(async blob => {
+                if (blob.size < 1000) return;
+                const hash = await getHash(blob);
+                if (STATE.images.has(hash)) return;
+                
+                STATE.images.set(hash, {
+                    blob, 
+                    originalName: getName(typeof input === 'string' ? input : input.url),
+                    blobUrl: null
+                });
+                STATE.count++;
+                renderUI();
+            });
+        }
+        return res;
+    };
+
+    const origObjURL = URL.createObjectURL;
+    URL.createObjectURL = function(blob) {
+        const url = origObjURL.apply(this, arguments);
+        if (blob instanceof Blob && blob.size > 1000) {
+            getHash(blob).then(hash => {
+                const item = STATE.images.get(hash);
+                if (item) item.blobUrl = url;
+                else {
+                    STATE.images.set(hash, { blob, originalName: `unknown_${Date.now()}`, blobUrl: url });
+                    STATE.count++;
+                    renderUI();
+                }
+            });
+        }
+        return url;
+    };
+
+    const origDraw = CanvasRenderingContext2D.prototype.drawImage;
+    CanvasRenderingContext2D.prototype.drawImage = function(img, ...args) {
+        const res = origDraw.apply(this, [img, ...args]);
+        try {
+            const src = img.src;
+            if (!src || src.startsWith('data:')) return res;
+            
+            if (!STATE.canvas[src]) STATE.canvas[src] = { w: 0, h: 0, cmds: [] };
+            const e = STATE.canvas[src];
+            
+            let p; // Normalize args: sx,sy,sw,sh,dx,dy,dw,dh
+            if (args.length === 8) p = { sx: args[0], sy: args[1], sw: args[2], sh: args[3], dx: args[4], dy: args[5], dw: args[6], dh: args[7] };
+            
+            if (p && p.dw > 0 && p.dh > 0) {
+                e.w = Math.max(e.w, p.dx + p.dw);
+                e.h = Math.max(e.h, p.dy + p.dh);
+                e.cmds.push(p);
+            }
+        } catch {}
+        return res;
+    };
+
+    function descramble(blob, data) {
+        return new Promise(resolve => {
+            const url = origObjURL.call(URL, blob);
+            const img = new Image();
+            img.onload = () => {
+                const c = document.createElement('canvas');
+                c.width = data.w; c.height = data.h;
+                const ctx = c.getContext('2d');
+                data.cmds.forEach(p => ctx.drawImage(img, p.sx, p.sy, p.sw, p.sh, p.dx, p.dy, p.dw, p.dh));
+                c.toBlob(b => { URL.revokeObjectURL(url); resolve(b); }, 'image/jpeg', 0.95);
+            };
+            img.onerror = () => resolve(blob);
+            img.src = url;
+        });
+    }
+})();
