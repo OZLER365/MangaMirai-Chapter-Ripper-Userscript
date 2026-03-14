@@ -5,7 +5,7 @@
 // @description  Capture, descramble, deduplicate, and download images. Renames sequentially (1..N) preserving original sort order.
 // @author       ozler365
 // @match        https://mangamirai.com/*
-// @license      MIT
+// @license      GPL-3.0-only
 // @icon         https://pbs.twimg.com/profile_images/1896093828861612032/HYJOz-c3_400x400.png
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js
