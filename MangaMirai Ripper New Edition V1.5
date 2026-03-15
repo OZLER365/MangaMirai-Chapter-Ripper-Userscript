@@ -1,0 +1,219 @@
+// ==UserScript==
+// @name         MangaMirai Ripper
+// @namespace    http://tampermonkey.net/
+// @version      1.5
+// @description  Captures images, watches the site solve the 18x26 puzzle, and copies its moves.
+// @author       ozler365
+// @match        https://mangamirai.com/*
+// @license      GPL-3.0-only
+// @icon         https://pbs.twimg.com/profile_images/1896093828861612032/HYJOz-c3_400x400.png
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const STATE = {
+        images: new Map(), // Hash -> { blob, originalName, blobUrl }
+        canvas: {},        // blobUrl -> { w, h, cmds: [] }
+        count: 0,
+        keysFound: 0,
+        uiPending: false
+    };
+
+    // --- Utilities ---
+    const toHex = b => b.toString(16).padStart(2, '0');
+    async function getHash(blob) {
+        const buf = await blob.arrayBuffer();
+        const hash = await crypto.subtle.digest('SHA-256', buf);
+        return Array.from(new Uint8Array(hash)).map(toHex).join('');
+    }
+
+    function getName(url) {
+        try {
+            return decodeURIComponent(new URL(url, location.origin).pathname.split('/').pop().split('?')[0]).trim();
+        } catch { return 'image.jpg'; }
+    }
+
+    // --- UI ---
+    const ui = document.createElement('div');
+    Object.assign(ui.style, {
+        position: 'fixed', bottom: '15px', right: '15px', width: '130px',
+        background: '#1a1a1a', color: '#eee', padding: '12px', borderRadius: '8px',
+        fontSize: '12px', fontFamily: 'sans-serif', zIndex: 999999,
+        boxShadow: '0 4px 10px rgba(0,0,0,0.5)', border: '1px solid #444'
+    });
+    ui.innerHTML = `<div id="md-stat" style="color:#aaa;margin-bottom:6px">Scroll to load pages</div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                        <span>Images:</span><span id="md-cnt" style="color:#4f9;font-weight:bold;">0</span>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:10px;">
+                        <span>Keys Found:</span><span id="md-keys" style="color:#f94;font-weight:bold;">0</span>
+                    </div>
+                    <button id="md-btn" style="width:100%;cursor:pointer;padding:6px;background:#36d;color:#fff;border:none;border-radius:4px;font-weight:bold;">Download</button>`;
+    document.body.appendChild(ui);
+
+    const els = { stat: ui.querySelector('#md-stat'), cnt: ui.querySelector('#md-cnt'), keys: ui.querySelector('#md-keys'), btn: ui.querySelector('#md-btn') };
+
+    function renderUI(txt) {
+        if (txt) els.stat.textContent = txt;
+        if (!STATE.uiPending) {
+            STATE.uiPending = true;
+            requestAnimationFrame(() => {
+                els.cnt.textContent = STATE.count;
+
+                // Count how many images we have captured the puzzle commands for
+                let k = 0;
+                STATE.images.forEach(item => {
+                    if (item.blobUrl && STATE.canvas[item.blobUrl] && STATE.canvas[item.blobUrl].cmds.length > 0) k++;
+                });
+                els.keys.textContent = k;
+                STATE.keysFound = k;
+
+                STATE.uiPending = false;
+            });
+        }
+    }
+
+    // --- Download & Reassembly Logic ---
+    els.btn.onclick = async () => {
+        if (STATE.keysFound < STATE.count) {
+            const proceed = confirm(`You have ${STATE.count} images, but only captured the puzzle keys for ${STATE.keysFound} of them. You should scroll down to load the rest before downloading. Proceed anyway?`);
+            if (!proceed) return;
+        }
+
+        els.btn.disabled = true;
+        const zip = new JSZip();
+        const sortFn = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' }).compare;
+        const list = Array.from(STATE.images.values()).sort((a, b) => sortFn(a.originalName, b.originalName));
+
+        for (let i = 0; i < list.length; i++) {
+            renderUI(`Solving ${i + 1}/${list.length}`);
+            const item = list[i];
+            let blob = item.blob;
+
+            // If we captured the 468 commands for this image, replay them!
+            const instr = item.blobUrl ? STATE.canvas[item.blobUrl] : null;
+            if (instr && instr.cmds.length > 0) {
+                try {
+                    blob = await descrambleWithCommands(blob, instr);
+                } catch (e) { console.error('Descramble failed', e); }
+            }
+
+            zip.file(`${i + 1}.jpg`, blob);
+        }
+
+        renderUI('Zipping...');
+        const content = await zip.generateAsync({ type: 'blob' });
+        saveAs(content, (document.title || 'chapter').trim() + '.zip');
+        renderUI('Done!'); els.btn.disabled = false;
+        setTimeout(() => renderUI('Scroll to load pages'), 3000);
+    };
+
+    /**
+     * Flawlessly recreates the image by replaying the exact instructions the site used.
+     */
+    function descrambleWithCommands(blob, data) {
+        return new Promise(resolve => {
+            const url = URL.createObjectURL(blob);
+            const img = new Image();
+            img.onload = () => {
+                const c = document.createElement('canvas');
+                // Use ceiling to ensure no pixels are chopped off the edges
+                c.width = Math.ceil(data.w);
+                c.height = Math.ceil(data.h);
+                const ctx = c.getContext('2d');
+
+                // Fill white background to prevent transparent bleed
+                ctx.fillStyle = '#FFFFFF';
+                ctx.fillRect(0, 0, c.width, c.height);
+
+                // Prevent blurry edges on the tiles
+                ctx.imageSmoothingEnabled = false;
+
+                // Replay every single tile placement exactly as the site did it
+                data.cmds.forEach(p => {
+                    ctx.drawImage(img, p.sx, p.sy, p.sw, p.sh, p.dx, p.dy, p.dw, p.dh);
+                });
+
+                c.toBlob(b => {
+                    URL.revokeObjectURL(url);
+                    resolve(b);
+                }, blob.type || 'image/jpeg', 0.95);
+            };
+            img.onerror = () => resolve(blob);
+            img.src = url;
+        });
+    }
+
+    // --- 1. Fetch Interceptor (Grabs high-res blobs) ---
+    const origFetch = window.fetch;
+    window.fetch = async function(input, init) {
+        const res = await origFetch.apply(this, arguments);
+        const type = res.headers.get('content-type');
+
+        if (type && type.includes('image')) {
+            const clone = res.clone();
+            clone.blob().then(async blob => {
+                if (blob.size < 1000) return;
+                const hash = await getHash(blob);
+                if (!STATE.images.has(hash)) {
+                    STATE.images.set(hash, { blob, originalName: getName(typeof input === 'string' ? input : input.url), blobUrl: null });
+                    STATE.count++;
+                    renderUI();
+                }
+            });
+        }
+        return res;
+    };
+
+    // --- 2. Blob URL Interceptor (Links our blobs to the site's image tags) ---
+    const origObjURL = URL.createObjectURL;
+    URL.createObjectURL = function(blob) {
+        const url = origObjURL.apply(this, arguments);
+        if (blob instanceof Blob && blob.size > 1000) {
+            getHash(blob).then(hash => {
+                const item = STATE.images.get(hash);
+                if (item) {
+                    item.blobUrl = url;
+                } else {
+                    STATE.images.set(hash, { blob, originalName: `img_${Date.now()}`, blobUrl: url });
+                    STATE.count++;
+                }
+                renderUI();
+            });
+        }
+        return url;
+    };
+
+    // --- 3. The Canvas Spy (Records the 468 tile placements) ---
+    const origDraw = CanvasRenderingContext2D.prototype.drawImage;
+    CanvasRenderingContext2D.prototype.drawImage = function(image, ...args) {
+        const res = origDraw.apply(this, [image, ...args]);
+        try {
+            let srcUrl = '';
+            if (image instanceof HTMLImageElement) srcUrl = image.src;
+            if (!srcUrl || srcUrl.startsWith('data:')) return res;
+
+            if (!STATE.canvas[srcUrl]) STATE.canvas[srcUrl] = { w: 0, h: 0, cmds: [] };
+            const e = STATE.canvas[srcUrl];
+
+            // Only capture grid-drawing commands (which use all 8 parameters)
+            if (args.length === 8) {
+                const p = { sx: args[0], sy: args[1], sw: args[2], sh: args[3], dx: args[4], dy: args[5], dw: args[6], dh: args[7] };
+                if (p.dw > 0 && p.dh > 0) {
+                    // Update the final expected width/height based on where pieces are placed
+                    e.w = Math.max(e.w, p.dx + p.dw);
+                    e.h = Math.max(e.h, p.dy + p.dh);
+                    e.cmds.push(p);
+                    renderUI(); // Update "Keys Found" counter
+                }
+            }
+        } catch (err) {}
+        return res;
+    };
+
+})();
