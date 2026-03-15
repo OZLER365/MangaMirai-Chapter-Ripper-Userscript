@@ -1,5 +1,5 @@
-*Scroll to the end and load al of the pages in the chapter then click on Download.
-* Caution - Image might not Download them as per their original order.
+*Ignore the warning if it founds less keys than the images.
+*Caution - Image might not Download them as per their original order.
 
 Help Keep This Userscript
 Updated and Running Smoothly
